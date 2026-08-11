@@ -1,10 +1,3 @@
-"""
-PDF Pipeline — Streamlit app with markdown visualizer.
-
-Run from the project root (next to the `pdf_pipeline/` package folder):
-
-    streamlit run main.py
-"""
 
 from __future__ import annotations
 
@@ -14,10 +7,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import streamlit as st
+import gradio as gr
 from huggingface_hub import snapshot_download
-import subprocess
-import platform
 
 from doc_pipeline import (
     DocLayoutV3,
@@ -60,27 +51,10 @@ def _resolve_local_or_download(
     Return `local_path` if it already exists on disk; otherwise download the
     repo via `downloader` (defaults to `huggingface_hub.snapshot_download`,
     swappable in tests) and return the resolved path to `filename` inside it.
-
     `progress_callback`, if given, is called once with a short human-readable
     message after this model is resolved (whether it was already local or
     freshly downloaded) — used to drive a live status indicator in the UI
-    without making this function depend on Streamlit.
-
-    Centralizing this "check local, else download" pattern also fixes bugs
-    present in the original per-model inline logic:
-    - the medium OCR recognizer path used to skip appending `filename`,
-      resolving to a directory instead of the actual model file
-    - the small OCR recognizer's fallback downloaded into the *medium*
-      model's local_dir by mistake
-    - `snapshot_download` has no `subfolder` parameter (that belongs to
-      `hf_hub_download`, a different function)
-    - each OCR det/rec model lives in its OWN single-purpose HF repo (e.g.
-      `PP-OCRv6_small_det_onnx` vs `PP-OCRv6_small_rec_onnx`) with no nested
-      `det/`/`rec/` folder remotely to filter for — so `allow_patterns`
-      matched nothing and silently downloaded zero files. The fix is to let
-      `local_dir` itself point at the desired nested destination (e.g.
-      `pp_ocr_small/det`) rather than trying to filter a subfolder that
-      doesn't exist on the remote side.
+    without making this function depend on Gradio.
     """
     if os.path.exists(local_path):
         if progress_callback:
@@ -96,17 +70,7 @@ def resolve_model_paths(downloader=snapshot_download, progress_callback=None) ->
     """
     Resolve local paths to every model weight the pipeline needs, downloading
     only what's missing. Pure function of the local filesystem + `downloader`
-    (injectable for tests — pass a fake/mock instead of hitting the network),
-    so it can be exercised directly:
-
-        paths = resolve_model_paths(downloader=fake_snapshot_download)
-        assert paths.ocr_rec_medium.endswith("inference.onnx")
-
-    `progress_callback`, if given, is called once per model with a short
-    status message — used to drive a live "all models ready" indicator in
-    the UI. Optional and side-effect-only, so it never affects the return
-    value and doesn't need to be supplied in tests.
-
+    (injectable for tests — pass a fake/mock instead of hitting the network).
     Safe to call more than once — every branch just checks for an existing
     local file first.
     """
@@ -123,7 +87,9 @@ def resolve_model_paths(downloader=snapshot_download, progress_callback=None) ->
         if progress_callback:
             progress_callback("bakhil-aissa/tableformerv1: already downloaded ✓")
     else:
-        table_artifacts = downloader(repo_id="bakhil-aissa/tableformerv1", local_dir="tableformerv1")
+        table_artifacts = downloader(
+            repo_id="bakhil-aissa/tableformerv1", local_dir="tableformerv1"
+        )
         if progress_callback:
             progress_callback("bakhil-aissa/tableformerv1: downloaded ✓")
 
@@ -151,7 +117,7 @@ def resolve_model_paths(downloader=snapshot_download, progress_callback=None) ->
     ocr_rec_small = _resolve_local_or_download(
         "pp_ocr_small/rec/inference.onnx",
         repo_id="PaddlePaddle/PP-OCRv6_small_rec_onnx",
-        local_dir="pp_ocr_small/rec",  # fixed: was "pp_ocr_medium" (collision) in the original
+        local_dir="pp_ocr_small/rec",
         downloader=downloader,
         progress_callback=progress_callback,
     )
@@ -168,10 +134,12 @@ def resolve_model_paths(downloader=snapshot_download, progress_callback=None) ->
 
 
 # --------------------------------------------------------------------------- #
-# Pipeline loading (Streamlit-cached; wraps the pure resolve step above)
+# Pipeline loading (module-level cache; replaces st.cache_resource)
 # --------------------------------------------------------------------------- #
-@st.cache_resource(show_spinner="Loading models…")
-def load_pipeline(
+_pipeline_cache: dict = {}
+
+
+def load_pipeline_cached(
     layout_model: str,
     table_artifact_root: str,
     table_variant: str,
@@ -180,26 +148,51 @@ def load_pipeline(
     det_path: str,
     rec_keys_path: str,
 ):
-    setup_pipeline_logging(level="INFO")
-    layout_detector = DocLayoutV3(layout_model)
-
-    table_runner = TableFormerONNX(
-        artifact_root=table_artifact_root,
-        variant=table_variant,
+    key = (
+        layout_model,
+        table_artifact_root,
+        table_variant,
+        ocr_backend_name,
+        rec_path,
+        det_path,
+        rec_keys_path,
     )
-    if ocr_backend_name == "rapidocr":
-        table_ocr_backend = get_ocr_backend(
-            ocr_backend_name, det_model_path=det_path, rec_model_path=rec_path, rec_keys_path=rec_keys_path
+    if key not in _pipeline_cache:
+        setup_pipeline_logging(level="INFO")
+        layout_detector = DocLayoutV3(layout_model)
+
+        table_runner = TableFormerONNX(
+            artifact_root=table_artifact_root,
+            variant=table_variant,
         )
-        page_ocr_backend = get_ocr_backend(
-            ocr_backend_name, det_model_path=det_path, rec_model_path=rec_path, rec_keys_path=rec_keys_path
+        if ocr_backend_name == "rapidocr":
+            table_ocr_backend = get_ocr_backend(
+                ocr_backend_name,
+                det_model_path=det_path,
+                rec_model_path=rec_path,
+                rec_keys_path=rec_keys_path,
+            )
+            page_ocr_backend = get_ocr_backend(
+                ocr_backend_name,
+                det_model_path=det_path,
+                rec_model_path=rec_path,
+                rec_keys_path=rec_keys_path,
+            )
+        else:
+            table_ocr_backend = get_ocr_backend(ocr_backend_name)
+            page_ocr_backend = get_ocr_backend(ocr_backend_name)
+        _pipeline_cache[key] = (
+            layout_detector,
+            page_ocr_backend,
+            table_runner,
+            table_ocr_backend,
         )
-    else:
-        table_ocr_backend = get_ocr_backend(ocr_backend_name)
-        page_ocr_backend = get_ocr_backend(ocr_backend_name)
-    return layout_detector, page_ocr_backend, table_runner, table_ocr_backend
+    return _pipeline_cache[key]
 
 
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
 def parse_pages(raw: str) -> list[int] | None:
     raw = raw.strip()
     if not raw:
@@ -217,7 +210,7 @@ def parse_pages(raw: str) -> list[int] | None:
 
 
 def resolve_markdown_images(markdown: str, base_dir: Path) -> str:
-    """Turn relative image links into absolute paths so Streamlit can render them."""
+    """Turn relative image links into absolute paths so Gradio can render them."""
 
     def _replace(match: re.Match[str]) -> str:
         alt, path = match.group(1), match.group(2)
@@ -233,166 +226,251 @@ def resolve_markdown_images(markdown: str, base_dir: Path) -> str:
     return IMAGE_LINK_RE.sub(_replace, markdown)
 
 
-def save_upload(uploaded_file, dest_dir: Path) -> Path:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    out_path = dest_dir / uploaded_file.name
-    out_path.write_bytes(uploaded_file.getbuffer())
-    return out_path
+# --------------------------------------------------------------------------- #
+# Gradio app
+# --------------------------------------------------------------------------- #
+def build_app(model_paths: ModelPaths) -> gr.Blocks:
+    mp = model_paths
+
+    with gr.Blocks(title="PDF Pipeline", theme=gr.themes.Soft()) as app:
+        gr.Markdown("# 📄 PDF Pipeline")
+        gr.Markdown("Extract structured markdown from PDFs and scanned images.")
+
+        # ---- Sidebar: settings ----
+        with gr.Sidebar():
+            gr.Markdown("## Settings")
+            layout_model_dd = gr.Dropdown(
+                choices=[mp.layout],
+                value=mp.layout,
+                label="Layout model",
+            )
+            table_artifact_dd = gr.Dropdown(
+                choices=[mp.table_artifacts],
+                value=mp.table_artifacts,
+                label="TableFormer artifacts",
+            )
+            table_variant_dd = gr.Dropdown(
+                choices=["accurate"],
+                value="accurate",
+                label="TableFormer variant",
+            )
+            ocr_backend_dd = gr.Dropdown(
+                choices=["rapidocr", "pytesseract"],
+                value="rapidocr",
+                label="OCR backend",
+            )
+            with gr.Group(visible=True) as rapidocr_group:
+                det_model_dd = gr.Dropdown(
+                    choices=[mp.ocr_det_small, mp.ocr_det_medium],
+                    value=mp.ocr_det_small,
+                    label="RapidOCR detector model",
+                )
+                rec_model_dd = gr.Dropdown(
+                    choices=[mp.ocr_rec_small, mp.ocr_rec_medium],
+                    value=mp.ocr_rec_small,
+                    label="RapidOCR recognizer model",
+                )
+                keys_model_dd = gr.Dropdown(
+                    choices=[mp.ocr_rec_keys],
+                    value=mp.ocr_rec_keys,
+                    label="RapidOCR keys model",
+                )
+            resolution_slider = gr.Slider(
+                minimum=72,
+                maximum=300,
+                value=150,
+                step=1,
+                label="PDF render DPI",
+            )
+            pages_textbox = gr.Textbox(
+                placeholder="1, 2, 5 — leave empty for all pages",
+                label="PDF pages (optional)",
+            )
+
+        # ---- Main: upload + preview ----
+        file_upload = gr.File(
+            label="Upload a PDF or image",
+            file_types=[
+                ".pdf", ".png", ".jpg", ".jpeg",
+                ".bmp", ".tif", ".tiff", ".webp", ".gif",
+            ],
+        )
+
+        with gr.Row():
+            with gr.Column(scale=2):
+                pdf_preview = gr.HTML(visible=False, label="Document preview")
+                image_preview = gr.Image(
+                    visible=False, label="Document preview", interactive=False
+                )
+            with gr.Column(scale=1):
+                file_info = gr.Markdown("")
+
+        extract_btn = gr.Button("Extract markdown", variant="primary")
+
+        # ---- Results ----
+        with gr.Tabs():
+            with gr.Tab("Preview"):
+                markdown_preview = gr.Markdown("")
+            with gr.Tab("Markdown source"):
+                markdown_source = gr.Code(language="markdown", show_label=False)
+            with gr.Tab("Download"):
+                download_btn = gr.DownloadButton(
+                    label="Download .md file",
+                    variant="primary",
+                )
+
+        # ---- Event wiring ----
+
+        # Toggle RapidOCR-specific controls
+        def toggle_rapidocr(backend: str):
+            return gr.update(visible=(backend == "rapidocr"))
+
+        ocr_backend_dd.change(
+            toggle_rapidocr, inputs=ocr_backend_dd, outputs=rapidocr_group
+        )
+
+        # File upload → preview + metadata
+        def handle_upload(file):
+            if file is None:
+                return (
+                    gr.update(visible=False, value=""),
+                    gr.update(visible=False, value=None),
+                    "",
+                )
+
+            file_path = Path(file)
+            suffix = file_path.suffix.lower()
+            file_size = file_path.stat().st_size / 1024
+            info = f"**File:** `{file_path.name}`\n\n**Size:** {file_size:.1f} KB"
+
+            if suffix == ".pdf":
+                with open(file_path, "rb") as fh:
+                    pdf_b64 = base64.b64encode(fh.read()).decode()
+                html = (
+                    f'<iframe src="data:application/pdf;base64,{pdf_b64}" '
+                    'width="100%" height="640" style="border:none;"></iframe>'
+                )
+                return (
+                    gr.update(visible=True, value=html),
+                    gr.update(visible=False, value=None),
+                    info,
+                )
+            elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+                return (
+                    gr.update(visible=False, value=""),
+                    gr.update(visible=True, value=str(file_path)),
+                    info,
+                )
+            else:
+                return (
+                    gr.update(visible=False, value=""),
+                    gr.update(visible=False, value=None),
+                    info,
+                )
+
+        file_upload.change(
+            handle_upload,
+            inputs=file_upload,
+            outputs=[pdf_preview, image_preview, file_info],
+        )
+
+        # Extract button → run pipeline
+        def handle_extract(
+            file,
+            layout,
+            table_root,
+            table_var,
+            ocr,
+            det,
+            rec,
+            keys,
+            dpi,
+            pages,
+        ):
+            if file is None:
+                gr.Warning("Please upload a document first.")
+                return "", "", None
+
+            try:
+                page_list = parse_pages(pages) if pages.strip() else None
+            except ValueError as exc:
+                gr.Warning(str(exc))
+                return "", "", None
+
+            # Copy uploaded file to a work directory
+            src_path = Path(file)
+            orig_name = src_path.name
+            work_dir = PROJECT_ROOT / ".gradio_output" / Path(orig_name).stem
+            work_dir.mkdir(parents=True, exist_ok=True)
+            doc_path = work_dir / orig_name
+            doc_path.write_bytes(src_path.read_bytes())
+
+            # Load (cached) pipeline
+            layout_detector, page_ocr_backend, table_runner, table_ocr_backend = (
+                load_pipeline_cached(
+                    layout,
+                    table_root,
+                    table_var,
+                    ocr,
+                    rec_path=rec,
+                    det_path=det,
+                    rec_keys_path=keys,
+                )
+            )
+
+            kwargs: dict = {"resolution": dpi}
+            if page_list is not None and doc_path.suffix.lower() == ".pdf":
+                kwargs["pages"] = page_list
+
+            try:
+                markdown_doc = process_document(
+                    str(doc_path),
+                    layout_detector,
+                    page_ocr_backend=page_ocr_backend,
+                    table_runner=table_runner,
+                    table_ocr_backend=table_ocr_backend,
+                    **kwargs,
+                )
+            except Exception as exc:
+                gr.Warning(f"Pipeline error: {exc}")
+                return "", "", None
+
+            preview_md = resolve_markdown_images(markdown_doc, work_dir)
+
+            output_path = work_dir / (doc_path.stem + ".md")
+            output_path.write_text(markdown_doc, encoding="utf-8")
+
+            gr.Info("Extraction complete.")
+            return preview_md, markdown_doc, str(output_path)
+
+        extract_btn.click(
+            handle_extract,
+            inputs=[
+                file_upload,
+                layout_model_dd,
+                table_artifact_dd,
+                table_variant_dd,
+                ocr_backend_dd,
+                det_model_dd,
+                rec_model_dd,
+                keys_model_dd,
+                resolution_slider,
+                pages_textbox,
+            ],
+            outputs=[markdown_preview, markdown_source, download_btn],
+        )
+
+    return app
 
 
 def main() -> None:
-    st.set_page_config(
-        page_title="PDF Pipeline",
-        page_icon="📄",
-        layout="wide",
-    )
-    st.title("PDF Pipeline")
-    st.caption("Extract structured markdown from PDFs and scanned images.")
+    print("Preparing models…")
+    model_paths = resolve_model_paths(progress_callback=print)
+    print("✅ All models ready")
 
-    if not st.session_state.get("models_ready"):
-        with st.status("Preparing models…", expanded=True) as status:
-            model_paths = resolve_model_paths(progress_callback=status.write)
-            status.update(label="✅ All models ready", state="complete", expanded=False)
-        st.session_state["models_ready"] = True
-        st.session_state["model_paths"] = model_paths
-    else:
-        model_paths = st.session_state["model_paths"]
-        st.caption("✅ All models ready")
+    app = build_app(model_paths)
+    app.launch()
 
-    with st.sidebar:
-        st.header("Settings")
-        layout_model = st.selectbox(
-            "Layout model",
-            options=[model_paths.layout],
-        )
-        table_artifact_root = st.selectbox(
-            "TableFormer artifacts",
-            options=[model_paths.table_artifacts],
-        )
-        table_variant = st.selectbox(
-            "TableFormer variant",
-            options=["accurate"],
-            index=0,
-        )
-        ocr_backend = st.selectbox(
-            "OCR backend",
-            options=["rapidocr", "pytesseract"],
-            index=0,
-        )
-        if ocr_backend == "rapidocr":
-            path_det = st.selectbox(
-                "RapidOCR detector model",
-                options=[model_paths.ocr_det_small, model_paths.ocr_det_medium],
-                index=0,
-            )
-            path_rec = st.selectbox(
-                "RapidOCR recognizer model",
-                options=[model_paths.ocr_rec_small, model_paths.ocr_rec_medium],
-                index=0,
-            )
-            path_keys = st.selectbox(
-                "RapidOCR keys model",
-                options=[model_paths.ocr_rec_keys],
-                index=0,
-            )
 
-        resolution = st.slider("PDF render DPI", min_value=72, max_value=300, value=150)
-        pages_raw = st.text_input(
-            "PDF pages (optional)",
-            placeholder="1, 2, 5 — leave empty for all pages",
-        )
-
-    uploaded = st.file_uploader(
-        "Upload a PDF or image",
-        type=["pdf", "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif"],
-    )
-
-    if uploaded is None:
-        st.info("Upload a document to start.")
-        return
-
-    col_preview, col_meta = st.columns([2, 1], gap="large")
-    with col_meta:
-        st.markdown(f"**File:** `{uploaded.name}`")
-        st.markdown(f"**Size:** {uploaded.size / 1024:.1f} KB")
-
-    with col_preview:
-        suffix = Path(uploaded.name).suffix.lower()
-        if suffix == ".pdf":
-            pdf_b64 = base64.b64encode(uploaded.getvalue()).decode()
-            st.markdown(
-                f'<iframe src="data:application/pdf;base64,{pdf_b64}" '
-                'width="100%" height="640" style="border:none;"></iframe>',
-                unsafe_allow_html=True,
-            )
-        elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
-            st.image(uploaded, use_container_width=True)
-
-    process = st.button("Extract markdown", type="primary", use_container_width=False)
-
-    if not process:
-        if "markdown_result" in st.session_state:
-            markdown_doc = st.session_state["markdown_result"]
-            doc_stem = st.session_state.get("doc_stem", PROJECT_ROOT)
-        else:
-            return
-    else:
-        try:
-            pages = parse_pages(pages_raw) if pages_raw else None
-        except ValueError as exc:
-            st.error(str(exc))
-            return
-
-        layout_detector, page_ocr_backend, table_runner, table_ocr_backend = load_pipeline(
-            layout_model,
-            table_artifact_root,
-            table_variant,
-            ocr_backend,
-            rec_path=path_rec,
-            det_path=path_det,
-            rec_keys_path=path_keys,
-        )
-
-        work_dir = PROJECT_ROOT / ".streamlit_output" / Path(uploaded.name).stem
-        doc_path = save_upload(uploaded, work_dir)
-        kwargs: dict = {"resolution": resolution}
-        if pages is not None and doc_path.suffix.lower() == ".pdf":
-            kwargs["pages"] = pages
-
-        with st.spinner("Running pipeline…"):
-            markdown_doc = process_document(
-                str(doc_path),
-                layout_detector,
-                page_ocr_backend=page_ocr_backend,
-                table_runner=table_runner,
-                table_ocr_backend=table_ocr_backend,
-                **kwargs,
-            )
-
-        st.session_state["markdown_result"] = markdown_doc
-        st.session_state["doc_stem"] = work_dir
-        st.session_state["output_name"] = doc_path.stem + ".md"
-        st.success("Extraction complete.")
-
-    preview_md = resolve_markdown_images(markdown_doc, Path(st.session_state.get("doc_stem", PROJECT_ROOT)))
-
-    tab_preview, tab_source, tab_download = st.tabs(["Preview", "Markdown source", "Download"])
-
-    with tab_preview:
-        st.markdown(preview_md, unsafe_allow_html=False)
-
-    with tab_source:
-        st.code(markdown_doc, language="markdown")
-
-    with tab_download:
-        output_name = st.session_state.get("output_name", "output.md")
-        st.download_button(
-            label="Download .md file",
-            data=markdown_doc,
-            file_name=output_name,
-            mime="text/markdown",
-            use_container_width=True,
-        )
-  
 if __name__ == "__main__":
     main()
