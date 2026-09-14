@@ -50,14 +50,28 @@ class OCRBackend(ABC):
         their global pixel-space bounding boxes [x1, y1, x2, y2]."""
         raise NotImplementedError
 
+    def clone_for_worker(self) -> "OCRBackend":
+        """Return an independent instance safe for parallel worker threads."""
+        return self
+
 
 class RapidOCRBackend(OCRBackend):
-    def __init__(self,det_model_path,rec_model_path,rec_keys_path):
+    def __init__(self, det_model_path, rec_model_path, rec_keys_path):
         from rapidocr_onnxruntime import RapidOCR
 
-        self._engine = RapidOCR( det_model_path=det_model_path,
-    rec_model_path=rec_model_path,
-    rec_keys_path=rec_keys_path)
+        self.det_model_path = det_model_path
+        self.rec_model_path = rec_model_path
+        self.rec_keys_path = rec_keys_path
+        self._engine = RapidOCR(
+            det_model_path=det_model_path,
+            rec_model_path=rec_model_path,
+            rec_keys_path=rec_keys_path,
+        )
+
+    def clone_for_worker(self) -> "RapidOCRBackend":
+        return RapidOCRBackend(
+            self.det_model_path, self.rec_model_path, self.rec_keys_path
+        )
 
     @staticmethod
     def _to_bgr(image: Image.Image) -> np.ndarray:
@@ -85,6 +99,9 @@ class PytesseractBackend(OCRBackend):
 
         self._pt = pytesseract
         self.lang = lang
+
+    def clone_for_worker(self) -> "PytesseractBackend":
+        return PytesseractBackend(lang=self.lang)
 
     def get_text_boxes(self, image: Image.Image) -> list[dict]:
         data = self._pt.image_to_data(image, lang=self.lang, output_type=self._pt.Output.DICT)

@@ -13,6 +13,8 @@ from huggingface_hub import snapshot_download
 from doc_pipeline import (
     DocLayoutV3,
     TableFormerONNX,
+    available_cpu_count,
+    compute_worker_count,
     get_ocr_backend,
     process_document,
     setup_pipeline_logging,
@@ -166,26 +168,19 @@ def load_pipeline_cached(
             variant=table_variant,
         )
         if ocr_backend_name == "rapidocr":
-            table_ocr_backend = get_ocr_backend(
-                ocr_backend_name,
-                det_model_path=det_path,
-                rec_model_path=rec_path,
-                rec_keys_path=rec_keys_path,
-            )
-            page_ocr_backend = get_ocr_backend(
+            ocr_backend = get_ocr_backend(
                 ocr_backend_name,
                 det_model_path=det_path,
                 rec_model_path=rec_path,
                 rec_keys_path=rec_keys_path,
             )
         else:
-            table_ocr_backend = get_ocr_backend(ocr_backend_name)
-            page_ocr_backend = get_ocr_backend(ocr_backend_name)
+            ocr_backend = get_ocr_backend(ocr_backend_name)
         _pipeline_cache[key] = (
             layout_detector,
-            page_ocr_backend,
+            ocr_backend,
             table_runner,
-            table_ocr_backend,
+            ocr_backend,
         )
     return _pipeline_cache[key]
 
@@ -285,6 +280,11 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
             pages_textbox = gr.Textbox(
                 placeholder="1, 2, 5 — leave empty for all pages",
                 label="PDF pages (optional)",
+            )
+            gr.Markdown(
+                f"**Parallel pages:** auto "
+                f"({available_cpu_count()} CPUs detected, up to "
+                f"{compute_worker_count(99)} workers for multi-page docs)"
             )
 
         # ---- Main: upload + preview ----
@@ -421,6 +421,19 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
             kwargs: dict = {"resolution": dpi}
             if page_list is not None and doc_path.suffix.lower() == ".pdf":
                 kwargs["pages"] = page_list
+
+            num_pages = 1
+            if doc_path.suffix.lower() == ".pdf":
+                import pdfplumber
+
+                with pdfplumber.open(doc_path) as pdf:
+                    num_pages = len(page_list) if page_list is not None else len(pdf.pages)
+            workers = compute_worker_count(num_pages)
+            if workers > 1:
+                gr.Info(
+                    f"Processing {num_pages} pages with {workers} parallel workers "
+                    f"({available_cpu_count()} CPUs)."
+                )
 
             try:
                 markdown_doc = process_document(

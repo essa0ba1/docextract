@@ -34,6 +34,8 @@ from .ocr_backends import (
 )
 from .pipeline import (
     IMAGE_EXTENSIONS,
+    available_cpu_count,
+    compute_worker_count,
     crop_and_save_image,
     process_document,
     process_images,
@@ -69,6 +71,8 @@ __all__ = [
     "PytesseractBackend",
     "RapidOCRBackend",
     "get_ocr_backend",
+    "available_cpu_count",
+    "compute_worker_count",
     "crop_and_save_image",
     "IMAGE_EXTENSIONS",
     "process_document",

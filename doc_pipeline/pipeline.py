@@ -33,12 +33,16 @@ ordered pages of one document).
 
 from __future__ import annotations
 
-import logging
-import os
-from pathlib import Path
-from typing import List, Optional, Sequence, Union
 import base64
 import io
+import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Sequence, Union
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -65,6 +69,128 @@ IMAGE_LIKE_CLASSES = {"chart", "header_image", "footer_image", "vision_footnote"
 
 # Extensions routed through the standalone-image path by process_document.
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
+
+# ORT sessions in layout/table modules typically use up to 4 intra-op threads.
+_ORT_THREADS_PER_WORKER = 4
+_MAX_WORKERS_CAP = 8
+
+
+def available_cpu_count() -> int:
+    """Return CPUs this process may use (cgroup/affinity-aware when supported)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, NotImplementedError, OSError):
+        return os.cpu_count() or 1
+
+
+def compute_worker_count(
+    num_pages: int,
+    *,
+    reserve_cpus: int = 1,
+    ort_threads_per_worker: int = _ORT_THREADS_PER_WORKER,
+    max_workers_cap: int = _MAX_WORKERS_CAP,
+) -> int:
+    """
+    Choose a parallel worker count from CPU topology.
+
+    Uses cgroup/affinity-aware ``available_cpu_count()``, reserves one CPU for
+    the main thread / UI, then picks::
+
+        min(max_cap, num_pages, ort_limited, half_of_usable)
+
+    where ``ort_limited = usable // ort_threads_per_worker`` avoids launching
+    more page workers than ONNX can usefully run when each session owns several
+    intra-op threads. The ``half_of_usable`` term keeps light parallelism on
+    laptops (e.g. 4 cores -> 2 workers for multi-page PDFs).
+    """
+    if num_pages <= 1:
+        return 1
+
+    usable = max(1, available_cpu_count() - reserve_cpus)
+    half_pool = max(1, (usable + 1) // 2)
+    if usable >= ort_threads_per_worker * 2:
+        ort_limited = max(1, usable // ort_threads_per_worker)
+        workers = min(ort_limited, half_pool)
+    else:
+        # Small machines: modest parallelism; ORT may oversubscribe slightly.
+        workers = half_pool
+    return min(workers, max_workers_cap, num_pages)
+
+
+@dataclass(frozen=True)
+class _RenderedPageJob:
+    page_index: int
+    order: int
+    img: Image.Image
+    page_tokens: Optional[List[PlacedWord]]
+
+
+_thread_local = threading.local()
+
+
+class _ThreadLocalOcrBackends:
+    """One OCR backend clone per worker thread (RapidOCR is not thread-safe)."""
+
+    def __init__(
+        self,
+        page_ocr_backend: Optional[OCRBackend],
+        table_ocr_backend: Optional[OCRBackend],
+    ):
+        self._page_template = page_ocr_backend
+        self._table_template = table_ocr_backend
+
+    def page_ocr(self) -> Optional[OCRBackend]:
+        if self._page_template is None:
+            return None
+        backend = getattr(_thread_local, "page_ocr_backend", None)
+        if backend is None:
+            backend = self._page_template.clone_for_worker()
+            _thread_local.page_ocr_backend = backend
+        return backend
+
+    def table_ocr(self) -> Optional[OCRBackend]:
+        if self._table_template is None:
+            return None
+        backend = getattr(_thread_local, "table_ocr_backend", None)
+        if backend is None:
+            backend = self._table_template.clone_for_worker()
+            _thread_local.table_ocr_backend = backend
+        return backend
+
+
+def _process_rendered_page_jobs_parallel(
+    jobs: Sequence[_RenderedPageJob],
+    layout_detector: DocLayoutV3,
+    doc_path: str,
+    page_ocr_backend: Optional[OCRBackend],
+    table_runner: Optional[TableFormerONNX],
+    table_ocr_backend: Optional[OCRBackend],
+    max_workers: int,
+) -> list[str]:
+    ocr_backends = _ThreadLocalOcrBackends(page_ocr_backend, table_ocr_backend)
+    markdown_by_order: list[str | None] = [None] * len(jobs)
+
+    def _run(job: _RenderedPageJob) -> None:
+        result = _process_rendered_page(
+            job.img,
+            layout_detector,
+            doc_path,
+            job.page_index,
+            job.page_tokens,
+            ocr_backends.page_ocr(),
+            table_runner,
+            ocr_backends.table_ocr(),
+        )
+        markdown_by_order[job.order] = result["markdown"]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run, job) for job in jobs]
+        for future in as_completed(futures):
+            future.result()
+
+    if any(chunk is None for chunk in markdown_by_order):
+        raise RuntimeError("Parallel page processing did not produce markdown for every page.")
+    return [markdown_by_order[i] for i in range(len(jobs))]
 
 
 def _to_bgr_array(img: Image.Image) -> np.ndarray:
@@ -372,30 +498,71 @@ def process_pdf(
     page_ocr_backend: Optional[OCRBackend] = None,
     table_runner: Optional[TableFormerONNX] = None,
     table_ocr_backend: Optional[OCRBackend] = None,
+    max_workers: Optional[int] = None,
 ) -> str:
     """
     Run the full diagram over an entire PDF (or a subset of page indices)
     and return one concatenated markdown document.
+
+    Pages are rendered sequentially (pdfplumber is not thread-safe), then
+    layout/OCR/table extraction runs in parallel when ``max_workers > 1``.
+    Pass ``max_workers=None`` (default) to pick a count from ``available_cpu_count()``.
+    Pass ``max_workers=1`` to force sequential processing.
     """
     import pdfplumber
 
     logger.info("Processing PDF: %s (pages=%s)", doc_path, pages if pages is not None else "all")
-    markdown_chunks = []
+    jobs: list[_RenderedPageJob] = []
     with pdfplumber.open(doc_path) as pdf:
         page_indices = pages if pages is not None else range(len(pdf.pages))
-        for i in page_indices:
+        for order, i in enumerate(page_indices):
             page = pdf.pages[i]
-            result = process_pdf_page(
-                page,
+            page_image = page.to_image(resolution=resolution)
+            img = page_image.original.copy()
+            img_w, img_h = img.size
+            logger.info(
+                "Rendering PDF page %d of %s (resolution=%d, image=%dx%d)",
+                i,
+                doc_path,
+                resolution,
+                img_w,
+                img_h,
+            )
+            page_tokens = pdfplumber_tokens_in_image_space(page, img_w, img_h)
+            logger.info("Page %d: pdfplumber extracted %d word tokens", i, len(page_tokens))
+            jobs.append(_RenderedPageJob(page_index=i, order=order, img=img, page_tokens=page_tokens))
+
+    workers = compute_worker_count(len(jobs)) if max_workers is None else max(1, min(max_workers, len(jobs)))
+    if workers <= 1:
+        markdown_chunks = [
+            _process_rendered_page(
+                job.img,
                 layout_detector,
                 doc_path,
-                page_index=i,
-                resolution=resolution,
-                page_ocr_backend=page_ocr_backend,
-                table_runner=table_runner,
-                table_ocr_backend=table_ocr_backend,
-            )
-            markdown_chunks.append(result["markdown"])
+                job.page_index,
+                job.page_tokens,
+                page_ocr_backend,
+                table_runner,
+                table_ocr_backend,
+            )["markdown"]
+            for job in jobs
+        ]
+    else:
+        logger.info(
+            "Parallel PDF processing: %d workers (%d CPUs available, %d pages)",
+            workers,
+            available_cpu_count(),
+            len(jobs),
+        )
+        markdown_chunks = _process_rendered_page_jobs_parallel(
+            jobs,
+            layout_detector,
+            doc_path,
+            page_ocr_backend,
+            table_runner,
+            table_ocr_backend,
+            workers,
+        )
 
     logger.info("Finished PDF: %s (%d pages)", doc_path, len(markdown_chunks))
     return "\n".join(markdown_chunks)
@@ -438,21 +605,55 @@ def process_images(
     page_ocr_backend: Optional[OCRBackend] = None,
     table_runner: Optional[TableFormerONNX] = None,
     table_ocr_backend: Optional[OCRBackend] = None,
+    max_workers: Optional[int] = None,
 ) -> str:
     """
     Run the diagram over a batch of standalone images (e.g. photographed
     pages of one physical document) in the given order, and return one
     concatenated markdown document — the image-input analog of `process_pdf`.
     """
+    if page_ocr_backend is None:
+        raise ValueError("process_images requires page_ocr_backend — standalone images have no text layer.")
+
     logger.info("Processing %d standalone images", len(image_paths))
-    chunks = []
-    for i, path in enumerate(image_paths):
-        result = process_image_page(
-            path, layout_detector, doc_path=str(path), page_index=i,
-            page_ocr_backend=page_ocr_backend, table_runner=table_runner,
-            table_ocr_backend=table_ocr_backend,
+    jobs: list[_RenderedPageJob] = []
+    for order, path in enumerate(image_paths):
+        logger.info("Loading standalone image page %d: %s", order, path)
+        img = Image.open(path).convert("RGB")
+        jobs.append(_RenderedPageJob(page_index=order, order=order, img=img, page_tokens=None))
+
+    workers = compute_worker_count(len(jobs)) if max_workers is None else max(1, min(max_workers, len(jobs)))
+    if workers <= 1:
+        chunks = [
+            _process_rendered_page(
+                job.img,
+                layout_detector,
+                str(image_paths[job.order]),
+                job.page_index,
+                job.page_tokens,
+                page_ocr_backend,
+                table_runner,
+                table_ocr_backend,
+            )["markdown"]
+            for job in jobs
+        ]
+    else:
+        logger.info(
+            "Parallel image batch: %d workers (%d CPUs available, %d pages)",
+            workers,
+            available_cpu_count(),
+            len(jobs),
         )
-        chunks.append(result["markdown"])
+        chunks = _process_rendered_page_jobs_parallel(
+            jobs,
+            layout_detector,
+            doc_path=str(image_paths[0]),
+            page_ocr_backend=page_ocr_backend,
+            table_runner=table_runner,
+            table_ocr_backend=table_ocr_backend,
+            max_workers=workers,
+        )
+
     logger.info("Finished image batch (%d pages)", len(chunks))
     return "\n".join(chunks)
 
@@ -465,6 +666,7 @@ def process_document(
     page_ocr_backend: Optional[OCRBackend] = None,
     table_runner: Optional[TableFormerONNX] = None,
     table_ocr_backend: Optional[OCRBackend] = None,
+    max_workers: Optional[int] = None,
 ) -> str:
     """
     Single entry point for the whole pipeline — dispatches to the PDF path
@@ -479,17 +681,26 @@ def process_document(
     if isinstance(path, (list, tuple)):
         logger.info("process_document: dispatching to process_images (%d paths)", len(path))
         return process_images(
-            path, layout_detector, page_ocr_backend=page_ocr_backend,
-            table_runner=table_runner, table_ocr_backend=table_ocr_backend,
+            path,
+            layout_detector,
+            page_ocr_backend=page_ocr_backend,
+            table_runner=table_runner,
+            table_ocr_backend=table_ocr_backend,
+            max_workers=max_workers,
         )
 
     suffix = Path(path).suffix.lower()
     if suffix == ".pdf":
         logger.info("process_document: dispatching to process_pdf (%s)", path)
         return process_pdf(
-            str(path), layout_detector, pages=pages, resolution=resolution,
-            page_ocr_backend=page_ocr_backend, table_runner=table_runner,
+            str(path),
+            layout_detector,
+            pages=pages,
+            resolution=resolution,
+            page_ocr_backend=page_ocr_backend,
+            table_runner=table_runner,
             table_ocr_backend=table_ocr_backend,
+            max_workers=max_workers,
         )
     if suffix in IMAGE_EXTENSIONS:
         logger.info("process_document: dispatching to process_image_page (%s)", path)
