@@ -1,0 +1,19 @@
+.git
+.gitignore
+__pycache__
+*.py[cod]
+.venv
+venv
+env
+.vscode
+.idea
+.pytest_cache
+.cache
+.streamlit_output
+.gradio_output
+
+# Large model dirs — downloaded at container start via Hugging Face Hub
+PP-DocLayout
+tableformerv1
+pp_ocr_small
+pp_ocr_medium

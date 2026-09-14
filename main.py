@@ -482,7 +482,10 @@ def main() -> None:
     print("✅ All models ready")
 
     app = build_app(model_paths)
-    app.launch()
+    app.launch(
+        server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
+        server_port=int(os.environ.get("PORT", os.environ.get("GRADIO_SERVER_PORT", "7860"))),
+    )
 
 
 if __name__ == "__main__":

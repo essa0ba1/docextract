@@ -1,0 +1,25 @@
+services:
+  docextract:
+    build: .
+    image: docextract:latest
+    container_name: docextract
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7860:7860"
+    environment:
+      GRADIO_SERVER_NAME: "0.0.0.0"
+      PORT: "7860"
+      HF_HOME: /app/.cache/huggingface
+      TRANSFORMERS_CACHE: /app/.cache/transformers
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+      - app_output:/app/.gradio_output
+    # ONNX + OCR are CPU-heavy; adjust to your Vultr plan.
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+volumes:
+  hf_cache:
+  app_output:
