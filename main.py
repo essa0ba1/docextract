@@ -1,9 +1,9 @@
-
 from __future__ import annotations
 
-import base64
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -221,6 +221,37 @@ def resolve_markdown_images(markdown: str, base_dir: Path) -> str:
     return IMAGE_LINK_RE.sub(_replace, markdown)
 
 
+def estimate_processing_seconds(
+    num_pages: int, workers: int, seconds_per_page: float = 4.0
+) -> float:
+    """
+    Rough wall-clock estimate used only to animate the progress bar smoothly
+    while `process_document` runs in the background. It is not a precise
+    measurement — real completion is still detected by the worker thread
+    finishing, so a bad estimate only makes the bar move faster/slower than
+    reality, never wrong about whether the job is actually done.
+    """
+    workers = max(workers, 1)
+    return max(seconds_per_page, (num_pages / workers) * seconds_per_page + 1.5)
+
+
+def render_progress_bar(fraction: float, desc: str) -> str:
+    """A plain HTML progress bar. Rendered directly into a gr.HTML component
+    so it's visible regardless of Gradio version/queue quirks — no reliance
+    on gr.Progress()'s internal streaming."""
+    pct = max(0, min(100, int(fraction * 100)))
+    return f"""
+<div style="margin:10px 0;font-family:inherit;">
+  <div style="font-size:0.9em;margin-bottom:6px;">{desc}</div>
+  <div style="background:#e5e7eb;border-radius:8px;overflow:hidden;height:18px;width:100%;">
+    <div style="background:#6366f1;height:100%;width:{pct}%;
+                transition:width 0.3s ease;"></div>
+  </div>
+  <div style="font-size:0.8em;color:#6b7280;margin-top:4px;">{pct}%</div>
+</div>
+"""
+
+
 # --------------------------------------------------------------------------- #
 # Gradio app
 # --------------------------------------------------------------------------- #
@@ -287,7 +318,7 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
                 f"{compute_worker_count(99)} workers for multi-page docs)"
             )
 
-        # ---- Main: upload + preview ----
+        # ---- Main: upload ----
         file_upload = gr.File(
             label="Upload a PDF or image",
             file_types=[
@@ -295,17 +326,18 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
                 ".bmp", ".tif", ".tiff", ".webp", ".gif",
             ],
         )
+        upload_status_html = gr.HTML("")
 
         with gr.Row():
-            with gr.Column(scale=2):
-                pdf_preview = gr.HTML(visible=False, label="Document preview")
-                image_preview = gr.Image(
-                    visible=False, label="Document preview", interactive=False
-                )
-            with gr.Column(scale=1):
-                file_info = gr.Markdown("")
+            extract_btn = gr.Button("Extract markdown", variant="primary", scale=3)
+            render_preview_cb = gr.Checkbox(
+                value=True,
+                label="Render markdown preview",
+                info="Uncheck to skip pretty-rendering — faster for large/table-heavy docs",
+                scale=2,
+            )
 
-        extract_btn = gr.Button("Extract markdown", variant="primary")
+        progress_html = gr.HTML("")
 
         # ---- Results ----
         with gr.Tabs():
@@ -329,52 +361,34 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
             toggle_rapidocr, inputs=ocr_backend_dd, outputs=rapidocr_group
         )
 
-        # File upload → preview + metadata
+        # File upload → just confirm receipt with a full progress bar. No
+        # document preview is rendered (that meant base64-encoding the whole
+        # PDF into an iframe on every upload, which is what was slow).
         def handle_upload(file):
             if file is None:
-                return (
-                    gr.update(visible=False, value=""),
-                    gr.update(visible=False, value=None),
-                    "",
-                )
+                return ""
 
             file_path = Path(file)
-            suffix = file_path.suffix.lower()
-            file_size = file_path.stat().st_size / 1024
-            info = f"**File:** `{file_path.name}`\n\n**Size:** {file_size:.1f} KB"
-
-            if suffix == ".pdf":
-                with open(file_path, "rb") as fh:
-                    pdf_b64 = base64.b64encode(fh.read()).decode()
-                html = (
-                    f'<iframe src="data:application/pdf;base64,{pdf_b64}" '
-                    'width="100%" height="640" style="border:none;"></iframe>'
-                )
-                return (
-                    gr.update(visible=True, value=html),
-                    gr.update(visible=False, value=None),
-                    info,
-                )
-            elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
-                return (
-                    gr.update(visible=False, value=""),
-                    gr.update(visible=True, value=str(file_path)),
-                    info,
-                )
-            else:
-                return (
-                    gr.update(visible=False, value=""),
-                    gr.update(visible=False, value=None),
-                    info,
-                )
+            size_kb = file_path.stat().st_size / 1024
+            size_label = f"{size_kb / 1024:.2f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
+            return render_progress_bar(1.0, f"✓ Uploaded: {file_path.name} ({size_label})")
 
         file_upload.change(
             handle_upload,
             inputs=file_upload,
-            outputs=[pdf_preview, image_preview, file_info],
+            outputs=upload_status_html,
         )
 
-        # Extract button → run pipeline
+        # Extract button → run pipeline, with a visible progress bar.
+        #
+        # `process_document` is a single blocking call and we don't control
+        # its internals, so we can't get true per-page progress out of it.
+        # Instead: run it in a background thread, and while it's alive,
+        # repeatedly `yield` an updated HTML progress bar against a rough
+        # time estimate. This is a generator function — every `yield` pushes
+        # a real UI update immediately, so the bar is guaranteed to actually
+        # move on screen (unlike gr.Progress(), whose streaming depends on
+        # queue/version details we can't verify here).
         def handle_extract(
             file,
             layout,
@@ -386,16 +400,21 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
             keys,
             dpi,
             pages,
+            render_preview,
         ):
             if file is None:
                 gr.Warning("Please upload a document first.")
-                return "", "", None
+                yield "", "", None, ""
+                return
 
             try:
                 page_list = parse_pages(pages) if pages.strip() else None
             except ValueError as exc:
                 gr.Warning(str(exc))
-                return "", "", None
+                yield "", "", None, ""
+                return
+
+            yield "", "", None, render_progress_bar(0.0, "Preparing document…")
 
             # Copy uploaded file to a work directory
             src_path = Path(file)
@@ -404,6 +423,10 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
             work_dir.mkdir(parents=True, exist_ok=True)
             doc_path = work_dir / orig_name
             doc_path.write_bytes(src_path.read_bytes())
+
+            yield "", "", None, render_progress_bar(
+                0.08, "Loading pipeline (first run may download models)…"
+            )
 
             # Load (cached) pipeline
             layout_detector, page_ocr_backend, table_runner, table_ocr_backend = (
@@ -429,32 +452,72 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
                 with pdfplumber.open(doc_path) as pdf:
                     num_pages = len(page_list) if page_list is not None else len(pdf.pages)
             workers = compute_worker_count(num_pages)
+
+            yield "", "", None, render_progress_bar(
+                0.15, f"Processing {num_pages} page(s) with {workers} worker(s)…"
+            )
             if workers > 1:
                 gr.Info(
                     f"Processing {num_pages} pages with {workers} parallel workers "
                     f"({available_cpu_count()} CPUs)."
                 )
 
-            try:
-                markdown_doc = process_document(
-                    str(doc_path),
-                    layout_detector,
-                    page_ocr_backend=page_ocr_backend,
-                    table_runner=table_runner,
-                    table_ocr_backend=table_ocr_backend,
-                    **kwargs,
+            result_holder: dict = {}
+            error_holder: dict = {}
+
+            def _worker() -> None:
+                try:
+                    result_holder["markdown"] = process_document(
+                        str(doc_path),
+                        layout_detector,
+                        page_ocr_backend=page_ocr_backend,
+                        table_runner=table_runner,
+                        table_ocr_backend=table_ocr_backend,
+                        **kwargs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error_holder["exc"] = exc
+
+            thread = threading.Thread(target=_worker, daemon=True)
+            thread.start()
+
+            estimated_total = estimate_processing_seconds(num_pages, workers)
+            start = time.time()
+            while thread.is_alive():
+                elapsed = time.time() - start
+                frac = 0.15 + 0.75 * min(elapsed / estimated_total, 1.0)
+                yield "", "", None, render_progress_bar(
+                    frac, f"Processing pages… (~{int(frac * 100)}%)"
                 )
-            except Exception as exc:
-                gr.Warning(f"Pipeline error: {exc}")
-                return "", "", None
+                time.sleep(0.3)
 
-            preview_md = resolve_markdown_images(markdown_doc, work_dir)
+            thread.join()
 
+            if "exc" in error_holder:
+                gr.Warning(f"Pipeline error: {error_holder['exc']}")
+                yield "", "", None, ""
+                return
+
+            markdown_doc = result_holder.get("markdown", "")
+
+            yield "", "", None, render_progress_bar(0.92, "Writing output file…")
             output_path = work_dir / (doc_path.stem + ".md")
             output_path.write_text(markdown_doc, encoding="utf-8")
 
+            if render_preview:
+                yield "", "", None, render_progress_bar(0.97, "Rendering preview…")
+                preview_md = resolve_markdown_images(markdown_doc, work_dir)
+            else:
+                preview_md = (
+                    "*Preview rendering skipped — check "
+                    '"Render markdown preview" to enable it, or see the '
+                    '"Markdown source" tab for the raw output.*'
+                )
+
             gr.Info("Extraction complete.")
-            return preview_md, markdown_doc, str(output_path)
+            yield preview_md, markdown_doc, str(output_path), render_progress_bar(
+                1.0, "Done ✓"
+            )
 
         extract_btn.click(
             handle_extract,
@@ -469,8 +532,9 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
                 keys_model_dd,
                 resolution_slider,
                 pages_textbox,
+                render_preview_cb,
             ],
-            outputs=[markdown_preview, markdown_source, download_btn],
+            outputs=[markdown_preview, markdown_source, download_btn, progress_html],
         )
 
     return app
@@ -482,6 +546,7 @@ def main() -> None:
     print("✅ All models ready")
 
     app = build_app(model_paths)
+    app.queue()  # required for the generator-based progress updates to stream live
     app.launch(
         server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
         server_port=int(os.environ.get("PORT", os.environ.get("GRADIO_SERVER_PORT", "7860"))),
