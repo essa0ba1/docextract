@@ -10,6 +10,15 @@ from pathlib import Path
 import gradio as gr
 from huggingface_hub import snapshot_download
 
+from doc_chat import (
+    DocumentIndex,
+    LLMError,
+    build_chat_messages,
+    format_sources,
+    load_markdown,
+    stream_chat_completion,
+)
+from doc_chat.llm import DEFAULT_BASE_URL, DEFAULT_MODEL
 from doc_pipeline import (
     DocLayoutV3,
     TableFormerONNX,
@@ -252,6 +261,15 @@ def render_progress_bar(fraction: float, desc: str) -> str:
 """
 
 
+def messages_chatbot(**kwargs) -> gr.Chatbot:
+    """Gradio 6 always uses the OpenAI-style messages format and dropped the
+    `type` argument that earlier versions need to opt into it."""
+    try:
+        return gr.Chatbot(type="messages", **kwargs)
+    except TypeError:
+        return gr.Chatbot(**kwargs)
+
+
 # --------------------------------------------------------------------------- #
 # Gradio app
 # --------------------------------------------------------------------------- #
@@ -318,6 +336,8 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
                 f"{compute_worker_count(99)} workers for multi-page docs)"
             )
 
+        index_state = gr.State(None)
+
         # ---- Main: upload ----
         file_upload = gr.File(
             label="Upload a PDF or image",
@@ -350,6 +370,53 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
                     label="Download .md file",
                     variant="primary",
                 )
+            with gr.Tab("Chat"):
+                gr.Markdown(
+                    "Upload a PDF, text file, or image, index it, then ask "
+                    "questions about its contents."
+                )
+                chat_file = gr.File(
+                    label="Document to chat with",
+                    file_types=[
+                        ".pdf", ".txt", ".md", ".markdown", ".csv", ".json",
+                        ".log", ".yaml", ".yml", ".png", ".jpg", ".jpeg",
+                        ".bmp", ".tif", ".tiff", ".webp", ".gif",
+                    ],
+                )
+                index_btn = gr.Button("Index document", variant="primary")
+                chat_status = gr.Markdown("No document indexed yet.")
+
+                with gr.Accordion("LLM settings", open=False):
+                    base_url_tb = gr.Textbox(
+                        value=DEFAULT_BASE_URL,
+                        label="API base URL",
+                        info="Any OpenAI-compatible endpoint "
+                        "(OpenAI, Groq, Together, vLLM, Ollama at "
+                        "http://localhost:11434/v1, …)",
+                    )
+                    model_tb = gr.Textbox(value=DEFAULT_MODEL, label="Model")
+                    api_key_tb = gr.Textbox(
+                        value="",
+                        label="API key",
+                        type="password",
+                        info="Leave empty to use $LLM_API_KEY / $OPENAI_API_KEY.",
+                    )
+                    temperature_slider = gr.Slider(
+                        minimum=0.0, maximum=1.0, value=0.2, step=0.05,
+                        label="Temperature",
+                    )
+                    top_k_slider = gr.Slider(
+                        minimum=1, maximum=12, value=4, step=1,
+                        label="Excerpts sent to the model",
+                    )
+
+                chatbot = messages_chatbot(height=420, label="Chat")
+                question_tb = gr.Textbox(
+                    placeholder="Ask something about the document…",
+                    show_label=False,
+                    submit_btn=True,
+                )
+                clear_chat_btn = gr.Button("Clear conversation")
 
         # ---- Event wiring ----
 
@@ -519,7 +586,7 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
                 1.0, "Done ✓"
             )
 
-        extract_btn.click(
+        extract_event = extract_btn.click(
             handle_extract,
             inputs=[
                 file_upload,
@@ -536,6 +603,144 @@ def build_app(model_paths: ModelPaths) -> gr.Blocks:
             ],
             outputs=[markdown_preview, markdown_source, download_btn, progress_html],
         )
+
+        # ---- Chat ----
+
+        def build_index(name: str, markdown: str) -> tuple[DocumentIndex | None, str]:
+            if not markdown.strip():
+                return None, "Nothing to index — the document produced no text."
+            index = DocumentIndex.build(name, markdown)
+            return index, (
+                f"**{name}** indexed — {len(index.chunks)} chunk(s) searchable. "
+                "Ask a question below."
+            )
+
+        def handle_index(
+            file, layout, table_root, table_var, ocr, det, rec, keys, dpi
+        ):
+            if file is None:
+                gr.Warning("Please upload a document first.")
+                return None, "No document indexed yet."
+
+            doc_path = Path(file)
+
+            def extract(path: str) -> str:
+                (
+                    layout_detector,
+                    page_ocr_backend,
+                    table_runner,
+                    table_ocr_backend,
+                ) = load_pipeline_cached(
+                    layout,
+                    table_root,
+                    table_var,
+                    ocr,
+                    rec_path=rec,
+                    det_path=det,
+                    rec_keys_path=keys,
+                )
+                return process_document(
+                    path,
+                    layout_detector,
+                    page_ocr_backend=page_ocr_backend,
+                    table_runner=table_runner,
+                    table_ocr_backend=table_ocr_backend,
+                    resolution=dpi,
+                )
+
+            try:
+                markdown_doc = load_markdown(doc_path, extract=extract)
+            except Exception as exc:  # noqa: BLE001 — surfaced in the UI
+                gr.Warning(f"Could not read document: {exc}")
+                return None, "No document indexed yet."
+
+            return build_index(doc_path.name, markdown_doc)
+
+        index_btn.click(
+            handle_index,
+            inputs=[
+                chat_file,
+                layout_model_dd,
+                table_artifact_dd,
+                table_variant_dd,
+                ocr_backend_dd,
+                det_model_dd,
+                rec_model_dd,
+                keys_model_dd,
+                resolution_slider,
+            ],
+            outputs=[index_state, chat_status],
+        )
+
+        # An extraction already produced the markdown — index it so the Chat
+        # tab is usable without re-running the pipeline on the same file.
+        def index_extracted(markdown_doc, file):
+            if not markdown_doc or file is None:
+                return gr.skip(), gr.skip()
+            return build_index(Path(file).name, markdown_doc)
+
+        extract_event.then(
+            index_extracted,
+            inputs=[markdown_source, file_upload],
+            outputs=[index_state, chat_status],
+        )
+
+        def handle_chat(question, history, index, base_url, model, api_key, temperature, top_k):
+            history = list(history or [])
+            question = (question or "").strip()
+            if not question:
+                yield history, ""
+                return
+            if index is None:
+                gr.Warning("Index a document first.")
+                yield history, question
+                return
+
+            chunks = index.retrieve(question, top_k=int(top_k))
+            messages = build_chat_messages(
+                question, chunks, history, document_name=index.name
+            )
+
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": ""})
+            yield history, ""
+
+            answer = ""
+            try:
+                for delta in stream_chat_completion(
+                    messages,
+                    base_url=base_url,
+                    model=model,
+                    api_key=api_key or None,
+                    temperature=temperature,
+                ):
+                    answer += delta
+                    history[-1]["content"] = answer
+                    yield history, ""
+            except LLMError as exc:
+                history[-1]["content"] = f"⚠️ {exc}"
+                yield history, ""
+                return
+
+            history[-1]["content"] = (answer or "*(empty response)*") + format_sources(chunks)
+            yield history, ""
+
+        question_tb.submit(
+            handle_chat,
+            inputs=[
+                question_tb,
+                chatbot,
+                index_state,
+                base_url_tb,
+                model_tb,
+                api_key_tb,
+                temperature_slider,
+                top_k_slider,
+            ],
+            outputs=[chatbot, question_tb],
+        )
+
+        clear_chat_btn.click(lambda: [], outputs=chatbot)
 
     return app
 
